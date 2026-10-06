@@ -18,11 +18,18 @@ type Store struct {
 	versions map[string]*MasterKeyVersion
 	activeID string
 	seq      int64
+	// activated 记录所有曾经成为活跃版本的 ID（含当前活跃版本）。
+	// 用于判定"普通调用方在版本活跃期间合法写入的密文"，
+	// 版本一旦活跃过即永久在册，不随停用/销毁移除。
+	activated map[string]bool
 }
 
 // NewStore 创建空密钥存储。
 func NewStore() *Store {
-	return &Store{versions: make(map[string]*MasterKeyVersion)}
+	return &Store{
+		versions:  make(map[string]*MasterKeyVersion),
+		activated: make(map[string]bool),
+	}
 }
 
 // CreateVersion 创建新的主密钥版本并返回。密钥材料随机生成，不对外暴露。
@@ -48,6 +55,7 @@ func (s *Store) createVersionLocked(id string) (*MasterKeyVersion, error) {
 	s.versions[id] = v
 	if s.activeID == "" {
 		s.activeID = id
+		s.activated[id] = true
 	}
 	return v, nil
 }
@@ -91,7 +99,7 @@ func (s *Store) Disable(id string) error {
 	}
 	v.State = StateDisabled
 	if s.activeID == id {
-		s.activeID = s.latestEnabledLocked()
+		s.setActiveLocked(s.latestEnabledLocked())
 	}
 	return nil
 }
@@ -113,7 +121,7 @@ func (s *Store) Destroy(id string) error {
 	}
 	v.material = nil
 	if s.activeID == id {
-		s.activeID = s.latestEnabledLocked()
+		s.setActiveLocked(s.latestEnabledLocked())
 	}
 	return nil
 }
@@ -145,8 +153,25 @@ func (s *Store) Rotate(newID string, fn func(newVersion *MasterKeyVersion) error
 			return nil, err
 		}
 	}
-	s.activeID = newID
+	s.setActiveLocked(newID)
 	return v, nil
+}
+
+// setActiveLocked 切换活跃指针，并把新活跃版本记入"曾活跃"名册。
+func (s *Store) setActiveLocked(id string) {
+	s.activeID = id
+	if id != "" {
+		s.activated[id] = true
+	}
+}
+
+// WasActive 报告版本是否曾经（或正在）担任活跃版本。
+// 用于读取兼容判定：普通调用方在版本活跃期间写入的密文，
+// 轮换后仍应可解，不因活跃指针前移而被判越权。
+func (s *Store) WasActive(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activated[id]
 }
 
 // Wrap 用指定版本包装数据密钥，不暴露主密钥材料。
