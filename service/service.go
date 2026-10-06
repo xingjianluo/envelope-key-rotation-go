@@ -15,10 +15,13 @@ var ErrPermissionDenied = errors.New("service: permission denied for key version
 // Caller 标识一个调用方及其被授权的密钥版本集合。
 type Caller struct {
 	Domain string
-	// AllowedVersions 为允许使用的版本集合；为空表示仅允许当前活跃版本。
+	// AllowedVersions 为允许使用的版本集合；为空表示普通调用方：
+	// 加密跟随当前活跃版本，解密兼容所有当前仍可解的历史版本。
 	AllowedVersions map[string]bool
 }
 
+// allows 判定加密方向的版本权限：空授权集仅允许活跃版本，
+// 非空授权集要求显式包含目标版本。
 func (c Caller) allows(versionID string, activeID string) bool {
 	if c.AllowedVersions == nil {
 		return versionID == activeID
@@ -28,14 +31,18 @@ func (c Caller) allows(versionID string, activeID string) bool {
 
 // Service 是信封加密与轮换服务入口。
 type Service struct {
-	store *kms.Store
-	codec *envelope.Codec
+	store   *kms.Store
+	codec   *envelope.Codec
+	records *RecordStore
 }
 
 // New 创建服务。
 func New(store *kms.Store, codec *envelope.Codec) *Service {
-	return &Service{store: store, codec: codec}
+	return &Service{store: store, codec: codec, records: NewRecordStore()}
 }
+
+// Records 返回服务持有的密文记录存储。
+func (s *Service) Records() *RecordStore { return s.records }
 
 // Encrypt 以调用方权限加密：一律使用当前活跃版本，且调用方须被授权该版本。
 func (s *Service) Encrypt(c Caller, plaintext []byte) (*envelope.Cipher, error) {
@@ -50,18 +57,19 @@ func (s *Service) Encrypt(c Caller, plaintext []byte) (*envelope.Cipher, error) 
 	return s.codec.Encrypt(plaintext)
 }
 
-// Decrypt 以调用方权限解密：按密文记录的版本选择主密钥，
-// 未知/已销毁版本由 kms 层拒绝，越权版本由本层拒绝，原因可区分。
+// Decrypt 以调用方权限解密：按密文记录的版本选择主密钥。
+//
+// 兼容语义：未做逐版本授权（AllowedVersions 为空）的普通调用方，
+// 可解密任何"当前仍可解"的版本（ENABLED/DISABLED）——轮换只改变版本号，
+// 不构成越权；版本已销毁或不存在时，由 kms 层返回可区分的版本错误
+// （ErrVersionDestroyed / ErrUnknownVersion），而非权限错误。
+// 显式授权集（AllowedVersions 非空）仍逐版本强制：不在集合内即
+// ErrPermissionDenied，与版本失效错误泾渭分明。
 func (s *Service) Decrypt(c Caller, cph *envelope.Cipher) ([]byte, error) {
 	if cph == nil {
 		return nil, fmt.Errorf("service: nil cipher")
 	}
-	active, err := s.store.ActiveVersion()
-	activeID := ""
-	if err == nil {
-		activeID = active.ID
-	}
-	if !c.allows(cph.KeyVersion, activeID) {
+	if c.AllowedVersions != nil && !c.AllowedVersions[cph.KeyVersion] {
 		return nil, fmt.Errorf("%w: caller %q may not decrypt with version %q",
 			ErrPermissionDenied, c.Domain, cph.KeyVersion)
 	}

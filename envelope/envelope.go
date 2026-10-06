@@ -34,11 +34,17 @@ func (c *Codec) Encrypt(plaintext []byte) (*Cipher, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.encryptWith(active.ID, plaintext)
+}
+
+// encryptWith 用指定版本加密明文。Wrap 会强制版本为 ENABLED，
+// 因此停用/销毁版本从任何路径都无法参与加密。
+func (c *Codec) encryptWith(versionID string, plaintext []byte) (*Cipher, error) {
 	dek := make([]byte, 32) // AES-256 数据密钥
 	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
 		return nil, fmt.Errorf("envelope: generate DEK: %w", err)
 	}
-	wrapped, err := c.store.Wrap(active.ID, dek)
+	wrapped, err := c.store.Wrap(versionID, dek)
 	if err != nil {
 		return nil, err
 	}
@@ -55,11 +61,36 @@ func (c *Codec) Encrypt(plaintext []byte) (*Cipher, error) {
 		return nil, fmt.Errorf("envelope: nonce: %w", err)
 	}
 	return &Cipher{
-		KeyVersion: active.ID,
+		KeyVersion: versionID,
 		WrappedDEK: wrapped,
 		Nonce:      nonce,
-		Ciphertext: gcm.Seal(nil, nonce, plaintext, []byte(active.ID)),
+		Ciphertext: gcm.Seal(nil, nonce, plaintext, []byte(versionID)),
 	}, nil
+}
+
+// ReWrap 将密文从当前记录版本迁移到 targetVersion（换保）：
+// 解出明文后在目标版本下重新加密，明文逐字节不变，改由目标版本保护。
+//
+// 语义：
+//   - 幂等：密文已在目标版本时原样返回，不重复生效；
+//   - 失败安全：任何一步失败都返回错误，原密文不被修改，可安全重试；
+//   - 硬约束：目标版本必须 ENABLED（由 Wrap 强制），停用/销毁版本
+//     无法作为迁移目标；源版本为 DESTROYED 时返回 ErrVersionDestroyed。
+func (c *Codec) ReWrap(cph *Cipher, targetVersion string) (*Cipher, error) {
+	if cph == nil {
+		return nil, fmt.Errorf("envelope: nil cipher")
+	}
+	if targetVersion == "" {
+		return nil, fmt.Errorf("envelope: target version must not be empty")
+	}
+	if cph.KeyVersion == targetVersion {
+		return cph, nil // 幂等：已在目标版本
+	}
+	plaintext, err := c.Decrypt(cph) // 用源版本解出明文（源版本须可解）
+	if err != nil {
+		return nil, err
+	}
+	return c.encryptWith(targetVersion, plaintext)
 }
 
 // Decrypt 依据密文记录的密钥版本解密：

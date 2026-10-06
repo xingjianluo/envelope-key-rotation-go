@@ -22,47 +22,70 @@ func newService(t *testing.T, ids ...string) *Service {
 	return New(store, envelope.NewCodec(store))
 }
 
-// 权限域：调用方只能使用被授权的版本。
+// 权限域：显式授权集逐版本强制；空授权集的普通调用方在轮换后
+// 仍可解密历史版本密文（读取兼容），但版本失效错误与越权错误可区分。
 func TestPermissionDomains(t *testing.T) {
 	svc := newService(t, "v1")
+
+	// 空授权集 = 普通调用方：加密跟随活跃版本，解密兼容可解的历史版本。
+	limited := Caller{Domain: "limited"}
+	// 显式授权 v2，不含 v1。
+	restricted := Caller{Domain: "restricted", AllowedVersions: map[string]bool{"v2": true}}
+	// 显式授权 v1 与 v2。
+	full := Caller{Domain: "full", AllowedVersions: map[string]bool{"v1": true, "v2": true}}
+
+	// 轮换前：limited 用当时的活跃版本 v1 写入历史密文。
+	old, err := svc.Encrypt(limited, []byte("old-secret"))
+	if err != nil {
+		t.Fatalf("encrypt before rotation: %v", err)
+	}
+	if old.KeyVersion != "v1" {
+		t.Fatalf("cipher version = %s; want v1", old.KeyVersion)
+	}
 	if err := svc.Rotate("v2"); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
-
-	// 空授权集 = 仅允许活跃版本（v2）。
-	limited := Caller{Domain: "limited"}
-	// 显式授权 v1 与 v2。
-	full := Caller{Domain: "full", AllowedVersions: map[string]bool{"v1": true, "v2": true}}
 
 	// limited 可用活跃版本 v2 加密。
 	cph, err := svc.Encrypt(limited, []byte("secret"))
 	if err != nil {
 		t.Fatalf("encrypt with active version: %v", err)
 	}
-	t.Logf("判定依据: caller=limited 空授权集 -> 仅允许活跃版本 %s, 加密成功", cph.KeyVersion)
+	t.Logf("判定依据: caller=limited 空授权集 -> 加密跟随活跃版本 %s, 加密成功", cph.KeyVersion)
 
-	// 构造一份 v1 密文（用 full 在轮换前无法补做，这里直接手动授权后由 codec 产生）：
-	// 通过将 v1 重新设为可用来生成历史密文不现实，改为：轮换前生成。
-	// 这里用 full 解密 limited 的 v2 密文验证授权路径。
+	// 读取兼容：轮换后 limited 仍能解开自己此前用 v1 写入的密文，
+	// 不能仅因版本号变了被当成越权。
+	got, err := svc.Decrypt(limited, old)
+	if err != nil || !bytes.Equal(got, []byte("old-secret")) {
+		t.Fatalf("limited decrypt own v1 cipher after rotation: got=%q err=%v", got, err)
+	}
+	t.Logf("判定依据: caller=limited 空授权集 -> 历史版本 %s 仍可解, 轮换不构成越权", old.KeyVersion)
+
+	// 真正越权仍被拦住：restricted 的显式授权集不含 v1。
+	if _, err := svc.Decrypt(restricted, old); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("restricted decrypt v1: %v; want ErrPermissionDenied", err)
+	}
+	t.Logf("判定依据: caller=restricted 显式授权集 {v2} 不含 v1 -> ErrPermissionDenied")
+
+	// full 解密 limited 的 v2 密文验证显式授权路径。
 	if _, err := svc.Decrypt(full, cph); err != nil {
 		t.Fatalf("full caller decrypt v2: %v", err)
 	}
 
-	// limited 解密 v1 版本密文应被权限层拒绝。
-	old := &envelope.Cipher{KeyVersion: "v1", WrappedDEK: cph.WrappedDEK, Nonce: cph.Nonce, Ciphertext: cph.Ciphertext}
-	if _, err := svc.Decrypt(limited, old); !errors.Is(err, ErrPermissionDenied) {
-		t.Fatalf("limited decrypt v1: %v; want ErrPermissionDenied", err)
-	}
-	t.Logf("判定依据: caller=limited 未授权版本 v1 -> ErrPermissionDenied")
-
-	// 越权错误与版本失效错误可区分：full 解密被销毁的 v1 密文应报版本错误而非权限错误。
+	// 越权错误与版本失效错误可区分：销毁 v1 后——
 	if err := svc.DestroyVersion("v1"); err != nil {
 		t.Fatalf("destroy v1: %v", err)
 	}
-	if _, err := svc.Decrypt(full, old); !errors.Is(err, kms.ErrVersionDestroyed) {
-		t.Fatalf("full decrypt destroyed v1: %v; want ErrVersionDestroyed", err)
+	// limited（空授权集）报版本失效而非越权；
+	if _, err := svc.Decrypt(limited, old); !errors.Is(err, kms.ErrVersionDestroyed) {
+		t.Fatalf("limited decrypt destroyed v1: %v; want ErrVersionDestroyed", err)
 	}
-	t.Logf("判定依据: caller=full 已授权 v1 但 v1 DESTROYED -> ErrVersionDestroyed (与权限错误可区分)")
+	t.Logf("判定依据: caller=limited 版本 v1 DESTROYED -> ErrVersionDestroyed (非权限错误)")
+	// restricted 仍报越权（权限判定先于版本状态，两条路径独立）。
+	if _, err := svc.Decrypt(restricted, old); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("restricted decrypt destroyed v1: %v; want ErrPermissionDenied", err)
+	}
+	t.Logf("判定依据: caller=restricted 未授权 v1 -> ErrPermissionDenied (与版本失效可区分)")
 }
 
 // 并发轮换：轮换期间并发读写不得观察到中间态；
